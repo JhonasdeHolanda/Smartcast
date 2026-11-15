@@ -1,3 +1,4 @@
 pymongo[srv]
 redis
 streamlit
+neo4j

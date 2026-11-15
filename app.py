@@ -2,6 +2,7 @@ import re
 import streamlit as st
 from mongo_service import MongoService
 from redis_service import RedisService
+from neo4j_service import Neo4jService
 
 st.set_page_config(
     page_title="Smart Cart | Loja de Tecnologia",
@@ -103,11 +104,12 @@ def gerar_id_cliente(nome: str) -> str:
 def iniciar_servicos():
     mongo = MongoService()
     redis_srv = RedisService()
-    return mongo, redis_srv
+    neo4j_srv = Neo4jService()
+    return mongo, redis_srv, neo4j_srv
 
 
 try:
-    mongo, redis_srv = iniciar_servicos()
+    mongo, redis_srv, neo4j_srv = iniciar_servicos()
 except Exception as e:
     st.error(f"Não foi possível conectar aos bancos de dados: {e}")
     st.stop()
@@ -125,7 +127,7 @@ sessao_ativa = (
 )
 
 # =============================================================================
-# BARRA LATERAL: CONTA, MAIS VISTOS E INFORMAÇÕES TÉCNICAS (TTL / REDIS)
+# BARRA LATERAL: CONTA, MAIS VISTOS E INFORMAÇÕES TÉCNICAS
 # =============================================================================
 with st.sidebar:
     st.markdown("## 🛍️ Minha Conta")
@@ -151,7 +153,6 @@ with st.sidebar:
     else:
         st.caption("Explore os produtos para gerar o ranking em tempo real.")
 
-    # Painel técnico recolhido com controles de TTL e chaves do Redis
     st.divider()
     with st.expander("🛠️ Informações técnicas"):
         ttl_sessao = st.number_input(
@@ -159,14 +160,12 @@ with st.sidebar:
             min_value=10,
             value=3600,
             step=30,
-            help="Tempo de expiração do token de login no Redis (SETEX).",
         )
         ttl_cache = st.number_input(
             "TTL do Cache do Catálogo (segundos)",
             min_value=10,
             value=300,
             step=30,
-            help="Tempo que a lista de produtos permanece na memória do Redis antes de expirar.",
         )
 
         if sessao_ativa:
@@ -188,17 +187,18 @@ with st.sidebar:
             st.toast("Estoque restaurado no MongoDB e cache invalidado!")
             st.rerun()
 
-    # Processa o login usando o TTL definido em "Informações técnicas"
     if not sessao_ativa and entrar_clicado:
         if not nome_input.strip():
             st.warning("Digite seu nome para continuar.")
         else:
             cli_id = gerar_id_cliente(nome_input)
+            cli_nome = nome_input.strip()
             token = redis_srv.criar_sessao(
                 cliente_id=cli_id,
-                cliente_nome=nome_input.strip(),
+                cliente_nome=cli_nome,
                 ttl_segundos=int(ttl_sessao),
             )
+            neo4j_srv.garantir_cliente(cli_id, cli_nome)
             st.session_state.token_sessao = token
             st.session_state.pagina_ativa = "catalogo"
             st.rerun()
@@ -222,6 +222,7 @@ if not sessao_ativa:
 
 cliente_id = sessao_ativa["cliente_id"]
 cliente_nome = sessao_ativa["cliente_nome"]
+neo4j_srv.garantir_cliente(cliente_id, cliente_nome)
 
 itens_carrinho = redis_srv.obter_carrinho(cliente_id)
 qtd_total_carrinho = sum(i["quantidade"] for i in itens_carrinho)
@@ -267,7 +268,7 @@ with nav4:
 st.write("")
 
 # =============================================================================
-# PÁGINA 1: CATÁLOGO DE PRODUTOS
+# PÁGINA 1: CATÁLOGO DE PRODUTOS (MONGODB ATLAS + CACHE REDIS)
 # =============================================================================
 if st.session_state.pagina_ativa == "catalogo":
     col_busca, col_cat, col_est = st.columns([3, 2, 1.2])
@@ -367,7 +368,7 @@ if st.session_state.pagina_ativa == "catalogo":
                         st.rerun()
 
 # =============================================================================
-# PÁGINA 2: CARRINHO E CHECKOUT
+# PÁGINA 2: CARRINHO E CHECKOUT (REDIS -> MONGODB ATLAS + NEO4J)
 # =============================================================================
 elif st.session_state.pagina_ativa == "carrinho":
     st.subheader("🛒 Seu Carrinho de Compras")
@@ -429,6 +430,7 @@ elif st.session_state.pagina_ativa == "carrinho":
                 )
 
                 if st.button("Finalizar Compra", type="primary", use_container_width=True):
+                    itens_para_grafo = list(itens_carrinho)
                     codigo = redis_srv.finalizar_checkout(
                         cliente_id=cliente_id,
                         cliente_nome=cliente_nome,
@@ -436,7 +438,15 @@ elif st.session_state.pagina_ativa == "carrinho":
                         forma_pagamento=forma_pgto,
                     )
                     if codigo:
-                        st.success(f"Compra confirmada! Pedido **{codigo}** registrado.")
+                        neo4j_srv.registrar_compra(
+                            cliente_id=cliente_id,
+                            cliente_nome=cliente_nome,
+                            itens_carrinho=itens_para_grafo,
+                        )
+                        st.success(
+                            f"Compra confirmada! Pedido **{codigo}** salvo no MongoDB "
+                            f"e relacionamento [:COMPROU] registrado no Neo4j."
+                        )
                         st.balloons()
                     else:
                         st.error("Não foi possível finalizar o pedido.")
@@ -470,10 +480,84 @@ elif st.session_state.pagina_ativa == "pedidos":
                     )
 
 # =============================================================================
-# PÁGINA 4: RECOMENDAÇÕES (NEO4J)
+# PÁGINA 4: RECOMENDAÇÕES PERSONALIZADAS (GRAFO NEO4J)
 # =============================================================================
 elif st.session_state.pagina_ativa == "recomendacoes":
-    st.subheader("✨ Recomendados para Você")
-    st.info(
-        "Área reservada para o motor de recomendação em grafos (Neo4j) baseado no histórico de compras."
-    )
+    st.subheader("✨ Recomendados para Você (Motor em Grafo Neo4j)")
+
+    recomendacoes = neo4j_srv.obter_recomendacoes_cruzadas(cliente_id, limite=4)
+
+    if recomendacoes:
+        st.caption(
+            "Sugestões geradas via Cypher (Index-Free Adjacency) com base em clientes de perfil similar:"
+        )
+        cols_rec = st.columns(2)
+        for idx, rec in enumerate(recomendacoes):
+            with cols_rec[idx % 2]:
+                with st.container(border=True):
+                    st.markdown(
+                        f'<span class="badge-brand">{rec.get("marca", "Marca")}</span>',
+                        unsafe_allow_html=True,
+                    )
+                    st.markdown(f"### {rec['nome']}")
+                    st.markdown(f"**{formatar_brl(rec.get('preco', 0))}**")
+                    similares = ", ".join(rec.get("clientes_similares", []))
+                    em_comum = ", ".join(rec.get("produtos_em_comum", []))
+                    st.caption(f"👥 Comprado/bem avaliado por: **{similares}**")
+                    st.caption(f"🔗 Afinidade por: _{em_comum}_")
+    else:
+        st.info(
+            "Compre ou avalie pelo menos 1 produto abaixo para ativar a recomendação cruzada "
+            "por perfil similar. Enquanto isso, veja os destaques do grafo:"
+        )
+        populares = neo4j_srv.obter_populares_no_grafo(cliente_id, limite=4)
+        cols_pop = st.columns(2)
+        for idx, pop in enumerate(populares):
+            with cols_pop[idx % 2]:
+                with st.container(border=True):
+                    st.markdown(f"### {pop['nome']}")
+                    st.markdown(f"**{formatar_brl(pop.get('preco', 0))}**")
+                    st.caption(
+                        f"Compras no grafo: **{pop.get('total_compras', 0)}** | "
+                        f"Nota média: **{pop.get('media_notas') or 'Sem notas'}**"
+                    )
+
+    st.divider()
+    col_av, col_rel = st.columns([1.2, 1.5])
+
+    with col_av:
+        st.markdown("### ⭐ Avaliar Produto (`[:AVALIOU]`)")
+        todos_produtos = mongo.listar_produtos()
+        if todos_produtos:
+            opcoes_prod = {p["nome"]: p for p in todos_produtos}
+            prod_escolhido_nome = st.selectbox("Produto", list(opcoes_prod.keys()))
+            nota_escolhida = st.slider("Nota", min_value=1, max_value=5, value=5)
+
+            if st.button("Registrar Avaliação no Neo4j", type="primary", use_container_width=True):
+                prod_obj = opcoes_prod[prod_escolhido_nome]
+                neo4j_srv.registrar_avaliacao(
+                    cliente_id=cliente_id,
+                    cliente_nome=cliente_nome,
+                    produto_id=str(prod_obj["_id"]),
+                    nota=nota_escolhida,
+                )
+                st.toast(f"Relacionamento [:AVALIOU {{nota: {nota_escolhida}}}] salvo no Neo4j!")
+                st.rerun()
+
+    with col_rel:
+        st.markdown("### 🕸️ Suas Conexões Atuais no Grafo")
+        conexoes = neo4j_srv.obter_grafo_cliente(cliente_id)
+        if not conexoes:
+            st.caption("Você ainda não possui arestas [:COMPROU] ou [:AVALIOU] no Neo4j.")
+        else:
+            for cx in conexoes:
+                if cx["relacao"] == "COMPROU":
+                    st.write(
+                        f"• `(:Cliente)` —**[:COMPROU ({cx.get('quantidade', 1)}x)]**→ "
+                        f"`(:Produto {cx['produto']})`"
+                    )
+                else:
+                    st.write(
+                        f"• `(:Cliente)` —**[:AVALIOU (nota {cx.get('nota')})]**→ "
+                        f"`(:Produto {cx['produto']})`"
+                    )
