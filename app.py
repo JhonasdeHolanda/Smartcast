@@ -222,7 +222,6 @@ if not sessao_ativa:
 
 cliente_id = sessao_ativa["cliente_id"]
 cliente_nome = sessao_ativa["cliente_nome"]
-neo4j_srv.garantir_cliente(cliente_id, cliente_nome)
 
 itens_carrinho = redis_srv.obter_carrinho(cliente_id)
 qtd_total_carrinho = sum(i["quantidade"] for i in itens_carrinho)
@@ -527,8 +526,10 @@ elif st.session_state.pagina_ativa == "recomendacoes":
 
     with col_av:
         st.markdown("### ⭐ Avaliar Produto (`[:AVALIOU]`)")
-        todos_produtos = mongo.listar_produtos()
-        if todos_produtos:
+        todos_produtos, _ = redis_srv.listar_produtos_com_cache(
+            mongo_service=mongo, apenas_em_estoque=False, ttl_segundos=int(ttl_cache)
+        )
+        if todos_produtos:        
             opcoes_prod = {p["nome"]: p for p in todos_produtos}
             prod_escolhido_nome = st.selectbox("Produto", list(opcoes_prod.keys()))
             nota_escolhida = st.slider("Nota", min_value=1, max_value=5, value=5)
